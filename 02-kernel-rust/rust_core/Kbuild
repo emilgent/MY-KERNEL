@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+# BEREICH 2.3 — In-Tree-Kbuild für das Rust-Modul rust_core
+#
+# Dieses Kbuild wird vom Kernel-Build-System verwendet, sobald das Verzeichnis
+# in den Kernel-Source-Tree integriert ist (siehe install-into-kernel.sh).
+#
+# CONFIG_RUST_CORE wird in Kconfig definiert und im .config-Fragment gesetzt
+# (CONFIG_RUST_CORE=m bzw. =y).
+
+obj-$(CONFIG_RUST_CORE) += rust_core.o

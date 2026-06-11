@@ -1,0 +1,29 @@
+# BEREICH 3.3 — systemd-Unit für den Mojo-AI-Daemon
+# ---------------------------------------------------------------------------
+# Installation (auf einem systemd-System):
+#   sudo mojo build mojo_ai_daemon.mojo -o /usr/local/bin/mojo_ai_daemon
+#   sudo cp mojo-ai.service /etc/systemd/system/mojo-ai.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mojo-ai.service
+#   systemctl status mojo-ai.service
+# ---------------------------------------------------------------------------
+[Unit]
+Description=Mojo AI Inference Daemon (Unix socket /run/mojo_ai.sock)
+After=network.target
+Documentation=https://github.com/emilgent/MY-KERNEL
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mojo_ai_daemon /run/mojo_ai.sock
+# Socket nach dem Start für alle Desktop-Clients les/schreibbar machen.
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/mojo_ai.sock ] && break; sleep 0.2; done; chmod 0666 /run/mojo_ai.sock || true'
+Restart=on-failure
+RestartSec=2
+# Härtung
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+RuntimeDirectory=mojo_ai
+
+[Install]
+WantedBy=multi-user.target

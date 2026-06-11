@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0
+# BEREICH 2.3 — Kconfig-Eintrag für rust_core
+#
+# Wird per `source "drivers/rust_core/Kconfig"` aus drivers/Kconfig
+# eingebunden (siehe install-into-kernel.sh).
+
+config RUST_CORE
+	tristate "rust_core: Rust misc char device (/dev/rust_core)"
+	depends on RUST
+	help
+	  Ein Beispiel-Treiber in Rust, der ein Misc-Charakter-Gerät unter
+	  /dev/rust_core bereitstellt. Über ioctl() lassen sich ein i32-Wert
+	  setzen/lesen sowie die Kernel-Metrik "Anzahl der open()-Aufrufe"
+	  auslesen.
+
+	  Zum Bauen als Modul "m" wählen (erzeugt rust_core.ko), zum festen
+	  Einbinden "y". Benötigt CONFIG_RUST=y (LLVM/Clang-Build).
+
+	  Im Zweifel "N".

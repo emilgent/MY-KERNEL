@@ -1,0 +1,74 @@
+#!/bin/sh
+# BEREICH 3.3 — SysVinit-Bootscript für LFS (Standard: LFS nutzt SysVinit).
+# ---------------------------------------------------------------------------
+# Installation auf einem LFS-System (LFS-Bootscripts-Layout):
+#   sudo cp mojo-ai.init /etc/rc.d/init.d/mojo-ai
+#   sudo chmod 0755 /etc/rc.d/init.d/mojo-ai
+#   # Symlinks für die gewünschten Runlevel (z. B. 3):
+#   sudo ln -sf ../init.d/mojo-ai /etc/rc.d/rc3.d/S50mojo-ai
+#   sudo ln -sf ../init.d/mojo-ai /etc/rc.d/rc0.d/K50mojo-ai
+#   sudo ln -sf ../init.d/mojo-ai /etc/rc.d/rc6.d/K50mojo-ai
+#
+# Nutzt die LFS-Funktionsbibliothek /lib/lsb/init-functions, fällt aber auf
+# einfache Implementierungen zurück, falls diese fehlt.
+# ---------------------------------------------------------------------------
+### BEGIN INIT INFO
+# Provides:            mojo-ai
+# Required-Start:      $local_fs
+# Required-Stop:       $local_fs
+# Default-Start:       3 4 5
+# Default-Stop:        0 1 2 6
+# Short-Description:   Mojo AI Inference Daemon
+# Description:         Startet den Mojo-AI-Daemon auf /run/mojo_ai.sock
+### END INIT INFO
+
+DAEMON=/usr/local/bin/mojo_ai_daemon
+SOCK=/run/mojo_ai.sock
+PIDFILE=/run/mojo_ai.pid
+NAME=mojo-ai
+
+[ -r /lib/lsb/init-functions ] && . /lib/lsb/init-functions
+
+start() {
+    echo "Starte $NAME ..."
+    if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "$NAME laeuft bereits (PID $(cat "$PIDFILE"))."
+        return 0
+    fi
+    rm -f "$SOCK"
+    "$DAEMON" "$SOCK" >/var/log/mojo-ai.log 2>&1 &
+    echo $! > "$PIDFILE"
+    # Socket für Desktop-Clients zugreifbar machen.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SOCK" ] && break; sleep 0.2; done
+    chmod 0666 "$SOCK" 2>/dev/null || true
+    echo "$NAME gestartet (PID $(cat "$PIDFILE"))."
+}
+
+stop() {
+    echo "Stoppe $NAME ..."
+    if [ -e "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    rm -f "$SOCK"
+    echo "$NAME gestoppt."
+}
+
+status() {
+    if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "$NAME laeuft (PID $(cat "$PIDFILE"))."
+        exit 0
+    else
+        echo "$NAME laeuft nicht."
+        exit 3
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0

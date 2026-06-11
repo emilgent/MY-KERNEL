@@ -1,0 +1,43 @@
+# BEREICH 4.1 — Sway (Wayland) Startkonfiguration
+# ---------------------------------------------------------------------------
+# Ablage: ~/.config/sway/config   (bzw. /etc/sway/config systemweit)
+#
+# Bootet direkt in eine minimalistische Wayland-Sitzung und startet das
+# transparente KI-Chat-Widget als Overlay auf dem Desktop-Hintergrund.
+#
+# Autostart der Sitzung beim Login (ohne Display-Manager), z. B. in
+# ~/.bash_profile auf TTY1:
+#   if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then exec sway; fi
+# ---------------------------------------------------------------------------
+
+set $mod Mod4
+
+# --- Eingabe / Optik -------------------------------------------------------
+font pango:DejaVu Sans Mono 10
+# Einfarbiger Desktop-Hintergrund (oder: output * bg /pfad/bild.png fill)
+output * bg #1a1b26 solid_color
+
+# --- Grundlegende Tastenbelegung -------------------------------------------
+bindsym $mod+Return exec foot          # Terminal (foot = minimaler Wayland-Term)
+bindsym $mod+d exec wmenu-run          # App-Launcher
+bindsym $mod+Shift+q kill
+bindsym $mod+Shift+e exec swaymsg exit
+floating_modifier $mod normal
+
+# --- Chat-Widget als schwebendes, randloses Overlay ------------------------
+# Das Widget setzt selbst app_id = "mojo-chat-widget". Wir fixieren Position,
+# Groesse und entfernen jegliche Fensterdekoration, damit es wie aufgemalt wirkt.
+for_window [app_id="mojo-chat-widget"] {
+    floating enable
+    border none
+    sticky enable
+    resize set 420 560
+    move position 40 px 60 px
+}
+
+# --- Autostart -------------------------------------------------------------
+# GTK-Layer-Shell-Variante des Widgets (zeichnet direkt auf den Hintergrund).
+exec /usr/local/bin/mojo-chat-widget --backend wayland --sock /run/mojo_ai.sock
+
+# Sicherstellen, dass der KI-Daemon läuft (systemd-System):
+exec systemctl --no-block start mojo-ai.service
