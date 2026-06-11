@@ -1,0 +1,6 @@
+# Build artifacts
+*.o
+*.ko
+*.pyc
+__pycache__/
+*.swp
