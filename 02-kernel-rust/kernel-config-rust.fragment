@@ -1,0 +1,49 @@
+# BEREICH 2.1 — Kernel-.config-Fragment für Rust-In-Tree-Support
+# ---------------------------------------------------------------------------
+# Diese Flags müssen in der .config aktiviert sein, damit der Kernel mit Rust-
+# Unterstützung baut und unser Modul (rust_core) eingebunden werden kann.
+#
+# Anwenden auf eine bestehende .config:
+#
+#   cd linux-<ver>
+#   make LLVM=1 defconfig
+#   ./scripts/kconfig/merge_config.sh .config \
+#       ../MY-KERNEL/02-kernel-rust/kernel-config-rust.fragment
+#   make LLVM=1 olddefconfig
+#   make LLVM=1 rustavailable      # MUSS "Rust is available!" melden
+#
+# WICHTIG: Rust im Kernel setzt einen reinen LLVM/Clang-Build voraus (LLVM=1).
+# CONFIG_RUST kann nur gesetzt werden, wenn rustc + bindgen in passender
+# Version vorhanden sind ("make rustavailable").
+# ---------------------------------------------------------------------------
+
+# --- Voraussetzungen: LLVM/Clang-Toolchain ---------------------------------
+CONFIG_CC_IS_CLANG=y
+
+# --- Rust-Kernkonfiguration ------------------------------------------------
+CONFIG_RUST_IS_AVAILABLE=y
+CONFIG_RUST=y
+
+# Optimierungslevel der Rust-Objekte (Standard wie beim C-Teil)
+CONFIG_RUSTC_VERSION_TEXT="rustc 1.74.1"
+
+# --- Modul-Unterstützung (für ladbares rust_core.ko) -----------------------
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+
+# --- Beispiel-/Sample-Module aus dem Kernelbaum (optional, zum Vergleich) ---
+# CONFIG_SAMPLES=y
+# CONFIG_SAMPLES_RUST=y
+# CONFIG_SAMPLE_RUST_MISC_DEVICE=m
+
+# --- Unser eigenes Rust-Modul (siehe rust_core/, in drivers/ eingehängt) ----
+# Als ladbares Modul:
+CONFIG_RUST_CORE=m
+# ... oder fest in den Kernel kompiliert:
+# CONFIG_RUST_CORE=y
+
+# --- Empfohlene Debug-Hilfen für Rust-Entwicklung --------------------------
+CONFIG_RUST_DEBUG_ASSERTIONS=y
+CONFIG_RUST_OVERFLOW_CHECKS=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_GDB_SCRIPTS=y

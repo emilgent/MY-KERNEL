@@ -1,0 +1,28 @@
+#!/bin/sh
+# BEREICH 4.1 — X11-Startkonfiguration (.xinitrc)
+# ---------------------------------------------------------------------------
+# Ablage: ~/.xinitrc
+#
+# Bootet per `startx` in eine minimale X11-Sitzung mit dem Window-Manager
+# Openbox und startet das transparente KI-Chat-Widget. Voraussetzung für die
+# Transparenz unter X11 ist ein laufender Compositor (picom).
+#
+# Automatischer Start auf TTY1 (in ~/.bash_profile):
+#   if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then exec startx; fi
+# ---------------------------------------------------------------------------
+
+# Composite-Manager für echte Transparenz (Alpha-Blending).
+picom --daemon --backend glx &
+
+# Einfarbiger Desktop-Hintergrund.
+xsetroot -solid "#1a1b26"
+
+# KI-Daemon sicherstellen (SysVinit-System):
+[ -x /etc/rc.d/init.d/mojo-ai ] && /etc/rc.d/init.d/mojo-ai start
+
+# Transparentes Chat-Widget (X11-Backend).
+/usr/local/bin/mojo-chat-widget --backend x11 --sock /run/mojo_ai.sock &
+
+# Window-Manager als letzten, blockierenden Prozess starten:
+# Solange Openbox läuft, läuft die X-Sitzung.
+exec openbox-session
