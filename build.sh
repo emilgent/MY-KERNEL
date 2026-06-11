@@ -112,14 +112,62 @@ prepare_kernel() {
         cp -v "$KERNEL_IMAGE" "$ISODIR/boot/vmlinuz"
     else
         log "Kein Kernel angegeben — nutze Host-Kernel (Demo-Modus)."
-        local hk
-        hk="/boot/vmlinuz-$(uname -r)"
-        [[ -f "$hk" ]] || hk="$(ls -1 /boot/vmlinuz-* 2>/dev/null | head -n1 || true)"
-        [[ -n "$hk" && -f "$hk" ]] || die "Kein Host-Kernel in /boot gefunden. Nutze --kernel-src oder --kernel-image."
+        local hk; hk="$(find_host_kernel)"
+        if [[ -z "$hk" ]]; then
+            warn "Kein Host-Kernel in /boot gefunden — beschaffe automatisch einen generischen Kernel ..."
+            hk="$(acquire_demo_kernel)" || true
+        fi
+        [[ -n "$hk" && -f "$hk" ]] || die "Kein bootfähiger Kernel verfügbar.
+  Installiere ein Kernel-Paket (z. B. 'sudo apt-get install -y linux-image-generic')
+  oder nutze --kernel-src /pfad/zu/linux-6.13 bzw. --kernel-image /pfad/zu/bzImage."
         cp -v "$hk" "$ISODIR/boot/vmlinuz"
         warn "Demo nutzt Host-Kernel ohne rust_core. Für rust_core: --kernel-src verwenden."
     fi
     ok "Kernel bereit: $ISODIR/boot/vmlinuz"
+}
+
+# Sucht einen vorhandenen vmlinuz auf dem Host; gibt den Pfad auf stdout aus.
+find_host_kernel() {
+    local hk
+    hk="/boot/vmlinuz-$(uname -r)"
+    [[ -f "$hk" ]] && { echo "$hk"; return 0; }
+    hk="$(ls -1 /boot/vmlinuz-* /boot/vmlinuz 2>/dev/null | head -n1 || true)"
+    [[ -n "$hk" && -f "$hk" ]] && echo "$hk"
+    return 0
+}
+
+# Beschafft im Demo-Modus automatisch einen Kernel: erst per apt (linux-image-*),
+# sonst als direkter Download des Debian-Netboot-Kernels. Pfad -> stdout.
+# Alle Status-/Tool-Ausgaben gehen nach stderr, damit stdout nur den Pfad enthält.
+acquire_demo_kernel() {
+    local sudo=""
+    [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1 && sudo="sudo"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        log "Installiere generischen Kernel via apt ..." >&2
+        $sudo apt-get update -qq >&2 || true
+        local pkg found
+        for pkg in linux-image-generic linux-image-amd64 linux-image-cloud-amd64 linux-image-virtual; do
+            if $sudo apt-get install -y --no-install-recommends "$pkg" >&2; then
+                ok "Kernel-Paket $pkg installiert." >&2
+                found="$(find_host_kernel)"
+                [[ -n "$found" ]] && { echo "$found"; return 0; }
+            fi
+        done
+        warn "apt konnte kein Kernel-Paket installieren — versuche Direkt-Download ..." >&2
+    fi
+
+    # Fallback: Debian-Netboot-Kernel (stabiler Pfad) direkt herunterladen.
+    local url="https://deb.debian.org/debian/dists/stable/main/installer-amd64/current/images/netboot/debian-installer/amd64/linux"
+    local dst="$WORK/netboot-vmlinuz"
+    if command -v curl >/dev/null 2>&1; then
+        log "Lade Debian-Netboot-Kernel herunter ..." >&2
+        curl -fsSL "$url" -o "$dst" >&2 && [[ -s "$dst" ]] && { echo "$dst"; return 0; }
+    elif command -v wget >/dev/null 2>&1; then
+        log "Lade Debian-Netboot-Kernel herunter ..." >&2
+        wget -qO "$dst" "$url" >&2 && [[ -s "$dst" ]] && { echo "$dst"; return 0; }
+    fi
+    return 1
 }
 
 # ===========================================================================
@@ -287,7 +335,13 @@ elif [ -f /usr/local/bin/mojo_ai_daemon.py ] && command -v python3 >/dev/null 2>
 else
     echo "[init] WARN: kein AI-Daemon im Rootfs (python3 fehlt?)."
 fi
-sleep 1
+
+# Auf den Socket warten (statt fixem sleep) — vermeidet Race beim Selbsttest.
+i=0
+while [ ! -S /run/mojo_ai.sock ] && [ "$i" -lt 50 ]; do
+    sleep 0.2 2>/dev/null || sleep 1
+    i=$((i + 1))
+done
 
 # Automatischer End-to-End-Selbsttest (Beweis im Boot-Log)
 if command -v python3 >/dev/null 2>&1 && [ -x /usr/local/bin/ai-client ]; then
