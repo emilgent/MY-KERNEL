@@ -4,3 +4,7 @@
 *.pyc
 __pycache__/
 *.swp
+
+# build.sh-Artefakte
+.build/
+*.iso
