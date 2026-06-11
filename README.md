@@ -66,6 +66,68 @@ echter Socket-Antwort.
 
 ---
 
+## Komplette Distro-Rootfs → Wayland-Desktop mit KI-Chat (`--distro`)
+
+Statt des minimalen BusyBox-Initramfs lässt sich eine **vollständige
+Linux-Distribution** (z. B. Debian/Ubuntu) als Rootfs einpacken. `build.sh`
+spielt dann automatisch alle 4 Bereiche in die Distro ein und konfiguriert einen
+**Sway/Wayland-Desktop**, der per **Autologin** direkt startet und das
+KI-Chat-Widget anzeigt:
+
+```bash
+# 1) Eine minimale Debian-Rootfs erzeugen (einmalig, ~5 min):
+sudo debootstrap --arch=amd64 --variant=minbase \
+     --include=systemd,systemd-sysv,dbus,udev,kmod,iproute2 \
+     bookworm /pfad/zur/distro-rootfs http://deb.debian.org/debian
+
+# 2) ISO bauen (Rust-Kernel + Distro-Rootfs + KI-Desktop). Braucht root:
+sudo ./build.sh --distro /pfad/zur/distro-rootfs
+
+#    Autologin-Benutzer ändern (Default: ai):
+sudo ./build.sh --distro /pfad/zur/distro-rootfs --distro-user max
+
+# 3) Grafisch in QEMU booten (virtio-gpu) + Screenshot des Desktops:
+sudo ./build.sh --distro /pfad/zur/distro-rootfs --test
+# oder manuell:
+qemu-system-x86_64 -m 3072 -cdrom my-kernel.iso -device virtio-gpu-pci
+```
+
+Was `--distro` automatisch in die Rootfs einrichtet:
+
+- **Desktop-Pakete** (best-effort per `apt-get`, falls noch nicht vorhanden):
+  `sway foot grim wofi fonts-dejavu-core dbus dbus-user-session
+  libgl1-mesa-dri seatd kmod python3 python3-gi gir1.2-gtk-3.0
+  gir1.2-gtklayershell-0.1`. Bringt die Distro bereits Sway mit, wird die
+  Paketinstallation übersprungen. Ohne `apt-get` (z. B. Arch/anderer
+  Paketmanager) wird eine Warnung ausgegeben und die Pakete müssen vorab
+  installiert sein.
+- **Autologin-Benutzer** (Default `ai`) mit Gruppen `video,render,input,tty`.
+  Eine `getty@tty1`-systemd-Drop-in (`agetty --autologin`) loggt ihn ohne
+  Passwort ein; `~/.bash_profile` startet auf TTY1 automatisch `sway`
+  (Software-Rendering via `WLR_RENDERER=pixman`, läuft also auch ohne GPU).
+- **Sway-Session**: `04-desktop-widget/sway/config` wird als
+  `~/.config/sway/config` **und** `/etc/sway/config` hinterlegt. Sie startet per
+  `exec` das Chat-Widget und führt `systemctl --no-block start mojo-ai.service`
+  aus.
+- **KI-Komponenten**: `mock_daemon.py` → `/usr/local/bin/mojo_ai_daemon.py`,
+  `chat_widget.py` → `/usr/local/bin/mojo-chat-widget`, dazu die systemd-Units
+  `mojo-ai.service` (Daemon auf `/run/mojo_ai.sock`) und `rust_core.service`
+  (lädt beim Boot `rust_core.ko` → `/dev/rust_core`) — beide via
+  `multi-user.target` aktiviert.
+
+Im Distro-Modus ist die Distro-Rootfs selbst das Initramfs (tmpfs-Root); der
+Kernel startet `systemd` als PID 1 (`rdinit=/sbin/init rw`). Ohne `--distro`
+bleibt alles beim bisherigen BusyBox-Minimalbau.
+
+Verifiziert: Eine via `debootstrap` erzeugte Debian-12-Rootfs bootet mit dem
+selbst gebauten Rust-Kernel (6.13) direkt in den Sway-Desktop; `rust_core.ko`
+wird geladen, `mojo-ai.service` läuft, und das Chat-Widget erscheint auf dem
+Desktop (Screenshot per QEMU-`screendump`):
+
+![MY-KERNEL Distro-Desktop mit KI-Chat-Widget](docs/desktop.png)
+
+---
+
 ## Verzeichnis- & Dateiübersicht (mit Ziel-Ablagepfaden)
 
 ### Bereich 1 — `01-lfs-toolchain/`

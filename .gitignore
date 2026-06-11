@@ -8,3 +8,5 @@ __pycache__/
 # build.sh-Artefakte
 .build/
 *.iso
+/desktop.png
+/desktop.ppm
