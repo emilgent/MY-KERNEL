@@ -16,19 +16,20 @@
 # (z. B. in QEMU) mit der KI chatten kann — ein lauffähiger End-to-End-Beweis.
 #
 # ---------------------------------------------------------------------------
-# Verwendung:
+# Verwendung (DEFAULT = komplettes System mit Kernel-Kompilierung):
 #
-#   ./build.sh                       # Demo-ISO: BusyBox-Rootfs + Host-Kernel
-#   ./build.sh --kernel-src /pfad/zu/linux-6.13   # baut Kernel + rust_core mit
-#   ./build.sh --kernel-image /boot/vmlinuz-x.y   # vorhandenes bzImage nutzen
+#   ./build.sh                       # STANDARD: baue Kernel + rust_core + Mojo-AI
+#   ./build.sh --kernel-src /pfad/zu/linux-6.13   # eigene Kernel-Source
+#   ./build.sh --kernel-image /boot/vmlinuz-x.y   # vorhandenes bzImage nutzen (Demo-Modus)
 #   ./build.sh --rootfs /mnt/lfs     # ein fertiges LFS-Rootfs einpacken
-#   ./build.sh --use-mojo            # echten Mojo-Daemon statt Python-Mock
+#   ./build.sh --use-mojo-binary     # echten Mojo-Daemon statt Python-Mock
 #   ./build.sh --out /tmp/my.iso
-#   ./build.sh --test                # nach dem Bau in QEMU booten (falls vorhanden)
+#   ./build.sh --no-test             # nicht in QEMU testen
+#   ./build.sh --demo                # Demo-ISO: BusyBox-Rootfs + Host-Kernel
 #
 # Abhängigkeiten (Host): xorriso, grub-mkrescue (grub-pc-bin/grub-efi-amd64-bin),
-#                        cpio, gzip, find; für --busybox: busybox(-static);
-#                        für --kernel-src: clang/llvm + rustc + bindgen.
+#                        cpio, gzip, find; für BusyBox: busybox(-static);
+#                        für Kernel-Src: clang/llvm + rustc + bindgen.
 # ===========================================================================
 set -euo pipefail
 
@@ -39,29 +40,31 @@ ROOTFS="$WORK/rootfs"
 ISODIR="$WORK/iso"
 OUT="$SELF/my-kernel.iso"
 
-# --- Optionen --------------------------------------------------------------
-KERNEL_SRC=""
+# --- Standard-Optionen (komplett-System aktiviert) -------------------------
+KERNEL_SRC="$SELF/02-kernel-rust"  # Standard: lokale Kernel-Source
 KERNEL_IMAGE=""
-EXT_ROOTFS=""
-USE_MOJO=0
-RUN_TEST=0
+EXT_ROOTFS="$SELF/../lfs-root"     # Standard: LFS-Rootfs falls vorhanden
+USE_MOJO=0                          # Python-Mock per default
+RUN_TEST=1                          # Test per default aktiviert
+DEMO_MODE=0                         # kein Demo-Modus per default
 
 log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,40p' "$0"; exit 0; }
+usage() { sed -n '2,50p' "$0"; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --kernel-src)   KERNEL_SRC="$2"; shift 2 ;;
-        --kernel-image) KERNEL_IMAGE="$2"; shift 2 ;;
-        --rootfs)       EXT_ROOTFS="$2"; shift 2 ;;
-        --out)          OUT="$2"; shift 2 ;;
-        --use-mojo)     USE_MOJO=1; shift ;;
-        --test)         RUN_TEST=1; shift ;;
-        -h|--help)      usage ;;
+        --kernel-src)       KERNEL_SRC="$2"; shift 2 ;;
+        --kernel-image)     KERNEL_IMAGE="$2"; KERNEL_SRC=""; shift 2 ;;
+        --rootfs)           EXT_ROOTFS="$2"; shift 2 ;;
+        --out)              OUT="$2"; shift 2 ;;
+        --use-mojo-binary)  USE_MOJO=1; shift ;;
+        --no-test)          RUN_TEST=0; shift ;;
+        --demo)             DEMO_MODE=1; KERNEL_SRC=""; EXT_ROOTFS=""; shift ;;
+        -h|--help)          usage ;;
         *) die "Unbekannte Option: $1 (siehe --help)" ;;
     esac
 done
@@ -76,12 +79,22 @@ check_deps() {
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     command -v grub-mkrescue >/dev/null 2>&1 || missing+=("grub-mkrescue")
-    if [[ -z "$EXT_ROOTFS" ]]; then
+    
+    # Bei Kernel-Kompilierung: zusätzliche Dependencies prüfen
+    if [[ -n "$KERNEL_SRC" && -f "$KERNEL_SRC/Makefile" ]]; then
+        for t in clang llvm rustc bindgen; do
+            command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+        done
+    fi
+    
+    # BusyBox nur ohne externes Rootfs nötig
+    if [[ ! -d "$EXT_ROOTFS" ]]; then
         command -v busybox >/dev/null 2>&1 || missing+=("busybox")
     fi
+    
     if [[ ${#missing[@]} -gt 0 ]]; then
         die "Fehlende Tools: ${missing[*]}
-  Ubuntu/Debian:  sudo apt-get install -y xorriso grub-pc-bin grub-efi-amd64-bin mtools cpio busybox-static qemu-system-x86"
+  Ubuntu/Debian:  sudo apt-get install -y xorriso grub-pc-bin grub-efi-amd64-bin mtools cpio busybox-static qemu-system-x86 clang llvm rustc bindgen"
     fi
     ok "Alle benötigten Tools vorhanden."
 }
@@ -91,9 +104,8 @@ check_deps() {
 # ===========================================================================
 prepare_kernel() {
     mkdir -p "$ISODIR/boot"
-    if [[ -n "$KERNEL_SRC" ]]; then
+    if [[ -n "$KERNEL_SRC" && -f "$KERNEL_SRC/Makefile" ]]; then
         log "Baue Kernel inkl. rust_core aus $KERNEL_SRC ..."
-        [[ -f "$KERNEL_SRC/Makefile" ]] || die "$KERNEL_SRC ist kein Kernel-Source-Tree."
         bash "$SELF/02-kernel-rust/install-into-kernel.sh" "$KERNEL_SRC"
         ( cd "$KERNEL_SRC"
           [[ -f .config ]] || make LLVM=1 defconfig
@@ -129,9 +141,8 @@ prepare_rootfs() {
     rm -rf "$ROOTFS"
     mkdir -p "$ROOTFS"/{bin,sbin,etc,proc,sys,dev,run,usr/bin,usr/local/bin,var/log}
 
-    if [[ -n "$EXT_ROOTFS" ]]; then
+    if [[ -d "$EXT_ROOTFS" ]]; then
         log "Kopiere externes Rootfs aus $EXT_ROOTFS ..."
-        [[ -d "$EXT_ROOTFS" ]] || die "Rootfs-Verzeichnis $EXT_ROOTFS existiert nicht."
         cp -a "$EXT_ROOTFS"/. "$ROOTFS"/
     else
         log "Erzeuge minimales BusyBox-Rootfs ..."
@@ -169,7 +180,7 @@ install_components() {
     if [[ "$USE_MOJO" -eq 0 ]]; then
         # Python-Mock + Interpreter müssen im Rootfs vorhanden sein.
         cp -v "$SELF/03-mojo-ai/mock_daemon.py" "$ROOTFS/usr/local/bin/mojo_ai_daemon.py"
-        if [[ -z "$EXT_ROOTFS" ]]; then
+        if [[ -z "$EXT_ROOTFS" || ! -d "$EXT_ROOTFS" ]]; then
             bundle_python
         fi
     fi
@@ -370,6 +381,7 @@ run_test() {
 # ===========================================================================
 main() {
     log "MY-KERNEL ISO-Build startet (WORK=$WORK)"
+    log "Modus: $([ "$DEMO_MODE" -eq 1 ] && echo 'DEMO' || echo 'STANDARD (komplettes System mit Kernel-Kompilierung)')"
     rm -rf "$ISODIR"
     mkdir -p "$ISODIR/boot"
     check_deps
@@ -389,10 +401,12 @@ main() {
  Auf USB-Stick schreiben (VORSICHT, /dev/sdX ersetzen):
    sudo dd if="$OUT" of=/dev/sdX bs=4M status=progress oflag=sync
 
- Hinweise:
-   * Für den echten Rust-Kernel: ./build.sh --kernel-src /pfad/zu/linux-6.13
-   * Für ein vollständiges grafisches System: ./build.sh --rootfs /mnt/lfs
-   * Für den echten Mojo-Daemon: ./build.sh --use-mojo (Binary vorher bauen)
+ Hinweise zum Customizen:
+   * Alternative Kernel-Source: ./build.sh --kernel-src /pfad/zu/linux-6.13
+   * Demo-Modus: ./build.sh --demo
+   * Benutzer-Rootfs: ./build.sh --rootfs /mnt/lfs
+   * Echten Mojo-Daemon: ./build.sh --use-mojo-binary
+   * Test deaktivieren: ./build.sh --no-test
 ============================================================================
 EOF
 }
