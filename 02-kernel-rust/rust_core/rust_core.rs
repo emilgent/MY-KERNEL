@@ -16,22 +16,25 @@
 //       - RUST_CORE_GET_OPENS : die Metrik "Anzahl der open()-Aufrufe" lesen,
 //       - RUST_CORE_HELLO     : eine Log-Nachricht ins Kernel-Log schreiben.
 //
-// Ziel-Kernel: 6.13 (In-Tree-Rust, `MiscDevice`-Abstraktion).
+// Ziel-Kernel: 6.13 (In-Tree-Rust, `MiscDevice`-Abstraktion). In dieser
+// Kernelversion hat `MiscDevice::open()` keine Argumente und `ioctl()` erhält
+// das geöffnete Gerät als `Pin<&Self>`; Logging erfolgt über `pr_info!`.
 // Build: siehe Kbuild / Makefile in diesem Verzeichnis.
 // ===========================================================================
+
+//! rust_core — ein Rust-In-Tree-Kernelmodul, das ein Misc-Charakter-Gerät unter
+//! `/dev/rust_core` bereitstellt. Über `ioctl()` lässt sich ein `i32`-Wert
+//! setzen/lesen sowie die Kernel-Metrik „Anzahl der `open()`-Aufrufe" auslesen.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel::{
     c_str,
-    device::Device,
-    fs::File,
     ioctl::{_IO, _IOC_SIZE, _IOR, _IOW},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     new_mutex,
     prelude::*,
     sync::Mutex,
-    types::ARef,
     uaccess::{UserSlice, UserSliceReader, UserSliceWriter},
 };
 
@@ -56,7 +59,9 @@ module! {
 
 /// Modul-Wurzelstruktur: hält die Registrierung des Misc-Geräts am Leben.
 /// Solange diese Struktur existiert, existiert /dev/rust_core.
+#[pin_data]
 struct RustCoreModule {
+    #[pin]
     _miscdev: MiscDeviceRegistration<RustCoreDevice>,
 }
 
@@ -79,7 +84,6 @@ impl kernel::InPlaceModule for RustCoreModule {
 struct RustCoreDevice {
     #[pin]
     inner: Mutex<Inner>,
-    dev: ARef<Device>,
 }
 
 /// Durch den Mutex geschützter, veränderlicher Zustand.
@@ -91,23 +95,21 @@ struct Inner {
 impl MiscDevice for RustCoreDevice {
     type Ptr = Pin<KBox<Self>>;
 
-    fn open(_file: &File, misc: &MiscDeviceRegistration<Self>) -> Result<Pin<KBox<Self>>> {
-        let dev = ARef::from(misc.device());
+    fn open() -> Result<Pin<KBox<Self>>> {
         let opens = OPEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        dev_info!(dev, "rust_core: open() #{}\n", opens);
+        pr_info!("rust_core: open() #{}\n", opens);
 
         KBox::try_pin_init(
             try_pin_init! {
                 RustCoreDevice {
                     inner <- new_mutex!(Inner { value: 0_i32 }),
-                    dev: dev,
                 }
             },
             GFP_KERNEL,
         )
     }
 
-    fn ioctl(me: Pin<&RustCoreDevice>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
+    fn ioctl(me: Pin<&RustCoreDevice>, cmd: u32, arg: usize) -> Result<isize> {
         let size = _IOC_SIZE(cmd);
         match cmd {
             RUST_CORE_GET_VALUE => me.get_value(UserSlice::new(arg, size).writer())?,
@@ -115,7 +117,7 @@ impl MiscDevice for RustCoreDevice {
             RUST_CORE_GET_OPENS => me.get_opens(UserSlice::new(arg, size).writer())?,
             RUST_CORE_HELLO => me.hello()?,
             _ => {
-                dev_err!(me.dev, "rust_core: unbekanntes ioctl: 0x{:x}\n", cmd);
+                pr_err!("rust_core: unbekanntes ioctl: 0x{:x}\n", cmd);
                 return Err(ENOTTY);
             }
         };
@@ -126,7 +128,7 @@ impl MiscDevice for RustCoreDevice {
 impl RustCoreDevice {
     fn get_value(&self, mut writer: UserSliceWriter) -> Result {
         let value = self.inner.lock().value;
-        dev_info!(self.dev, "rust_core: GET_VALUE -> {}\n", value);
+        pr_info!("rust_core: GET_VALUE -> {}\n", value);
         writer.write::<i32>(&value)?;
         Ok(())
     }
@@ -134,25 +136,20 @@ impl RustCoreDevice {
     fn set_value(&self, mut reader: UserSliceReader) -> Result {
         let new_value = reader.read::<i32>()?;
         let mut guard = self.inner.lock();
-        dev_info!(
-            self.dev,
-            "rust_core: SET_VALUE {} -> {}\n",
-            guard.value,
-            new_value
-        );
+        pr_info!("rust_core: SET_VALUE {} -> {}\n", guard.value, new_value);
         guard.value = new_value;
         Ok(())
     }
 
     fn get_opens(&self, mut writer: UserSliceWriter) -> Result {
         let opens = OPEN_COUNT.load(Ordering::Relaxed);
-        dev_info!(self.dev, "rust_core: GET_OPENS -> {}\n", opens);
+        pr_info!("rust_core: GET_OPENS -> {}\n", opens);
         writer.write::<u64>(&opens)?;
         Ok(())
     }
 
     fn hello(&self) -> Result {
-        dev_info!(self.dev, "rust_core: Hallo aus dem Kernel-Rust-Modul!\n");
+        pr_info!("rust_core: Hallo aus dem Kernel-Rust-Modul!\n");
         Ok(())
     }
 }

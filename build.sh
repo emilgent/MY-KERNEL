@@ -18,9 +18,12 @@
 # ---------------------------------------------------------------------------
 # Verwendung (DEFAULT = komplettes System mit Kernel-Kompilierung):
 #
-#   ./build.sh                       # STANDARD: baue Kernel + rust_core + Mojo-AI
-#   ./build.sh --kernel-src /pfad/zu/linux-6.13   # eigene Kernel-Source
-#   ./build.sh --kernel-image /boot/vmlinuz-x.y   # vorhandenes bzImage nutzen (Demo-Modus)
+#   ./build.sh                       # STANDARD: lädt Linux 6.13, richtet die
+#                                    # Toolchain ein, kompiliert Kernel +
+#                                    # rust_core und baut die ISO
+#   ./build.sh --kernel-ver 6.13     # andere Kernel-Version laden + bauen
+#   ./build.sh --kernel-src /pfad/zu/linux-6.13   # eigenen Quellbaum bauen
+#   ./build.sh --kernel-image /boot/vmlinuz-x.y   # vorhandenes bzImage (Demo)
 #   ./build.sh --rootfs /mnt/lfs     # ein fertiges LFS-Rootfs einpacken
 #   ./build.sh --use-mojo-binary     # echten Mojo-Daemon statt Python-Mock
 #   ./build.sh --out /tmp/my.iso
@@ -28,8 +31,9 @@
 #   ./build.sh --demo                # Demo-ISO: BusyBox-Rootfs + Host-Kernel
 #
 # Abhängigkeiten (Host): xorriso, grub-mkrescue (grub-pc-bin/grub-efi-amd64-bin),
-#                        cpio, gzip, find; für BusyBox: busybox(-static);
-#                        für Kernel-Src: clang/llvm + rustc + bindgen.
+#                        cpio, gzip, find; für BusyBox: busybox(-static).
+# Der Kernel-Build braucht clang/llvm + rustc (+ rust-src) + bindgen — diese
+# werden im STANDARD-Modus bei vorhandenem apt/rustup automatisch eingerichtet.
 # ===========================================================================
 set -euo pipefail
 
@@ -41,12 +45,15 @@ ISODIR="$WORK/iso"
 OUT="$SELF/my-kernel.iso"
 
 # --- Standard-Optionen (komplett-System aktiviert) -------------------------
-KERNEL_SRC="$SELF/02-kernel-rust"  # Standard: lokale Kernel-Source
+BUILD_KERNEL=1                      # Standard: echten Rust-Kernel selbst bauen
+KERNEL_VER="6.13"                   # Linux-Version, die geladen + gebaut wird
+KERNEL_SRC=""                       # leer => Quellen werden heruntergeladen
 KERNEL_IMAGE=""
 EXT_ROOTFS="$SELF/../lfs-root"     # Standard: LFS-Rootfs falls vorhanden
 USE_MOJO=0                          # Python-Mock per default
 RUN_TEST=1                          # Test per default aktiviert
 DEMO_MODE=0                         # kein Demo-Modus per default
+BINDGEN_VERSION="0.69.4"           # mit Linux 6.13 verifizierte bindgen-Version
 
 log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
@@ -57,13 +64,14 @@ usage() { sed -n '2,50p' "$0"; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --kernel-src)       KERNEL_SRC="$2"; shift 2 ;;
-        --kernel-image)     KERNEL_IMAGE="$2"; KERNEL_SRC=""; shift 2 ;;
+        --kernel-src)       KERNEL_SRC="$2"; BUILD_KERNEL=0; shift 2 ;;
+        --kernel-ver)       KERNEL_VER="$2"; shift 2 ;;
+        --kernel-image)     KERNEL_IMAGE="$2"; KERNEL_SRC=""; BUILD_KERNEL=0; shift 2 ;;
         --rootfs)           EXT_ROOTFS="$2"; shift 2 ;;
         --out)              OUT="$2"; shift 2 ;;
         --use-mojo-binary)  USE_MOJO=1; shift ;;
         --no-test)          RUN_TEST=0; shift ;;
-        --demo)             DEMO_MODE=1; KERNEL_SRC=""; EXT_ROOTFS=""; shift ;;
+        --demo)             DEMO_MODE=1; BUILD_KERNEL=0; KERNEL_SRC=""; EXT_ROOTFS=""; shift ;;
         -h|--help)          usage ;;
         *) die "Unbekannte Option: $1 (siehe --help)" ;;
     esac
@@ -79,14 +87,11 @@ check_deps() {
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     command -v grub-mkrescue >/dev/null 2>&1 || missing+=("grub-mkrescue")
-    
-    # Bei Kernel-Kompilierung: zusätzliche Dependencies prüfen
-    if [[ -n "$KERNEL_SRC" && -f "$KERNEL_SRC/Makefile" ]]; then
-        for t in clang llvm rustc bindgen; do
-            command -v "$t" >/dev/null 2>&1 || missing+=("$t")
-        done
-    fi
-    
+
+    # Hinweis: Die Kernel-/Rust-Toolchain (clang/llvm, rustc, bindgen) wird bei
+    # BUILD_KERNEL=1 automatisch von setup_kernel_toolchain eingerichtet und
+    # daher hier NICHT als harte Voraussetzung geprüft.
+
     # BusyBox nur ohne externes Rootfs nötig
     if [[ ! -d "$EXT_ROOTFS" ]]; then
         command -v busybox >/dev/null 2>&1 || missing+=("busybox")
@@ -100,24 +105,101 @@ check_deps() {
 }
 
 # ===========================================================================
+# 1a) Toolchain für den Rust-Kernel-Build einrichten (clang/llvm, rustc, bindgen)
+# ===========================================================================
+setup_kernel_toolchain() {
+    log "Richte Toolchain für den Rust-Kernel-Build ein ..."
+    local SUDO=""
+    if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -qq || warn "apt-get update fehlgeschlagen — fahre fort."
+        $SUDO apt-get install -y clang lld llvm libclang-dev flex bison \
+            libelf-dev libssl-dev bc kmod cpio >&2 \
+            || warn "apt-Installation unvollständig — prüfe Tools manuell."
+    else
+        warn "Kein apt-get gefunden — clang/llvm/flex/bison/libelf/libssl bitte manuell bereitstellen."
+    fi
+
+    # Rust-Toolchain (rustc + rust-src + bindgen)
+    if ! command -v rustc >/dev/null 2>&1 && ! command -v rustup >/dev/null 2>&1; then
+        die "rustc/rustup nicht gefunden. Bitte Rust installieren: https://rustup.rs"
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
+    if command -v rustup >/dev/null 2>&1; then
+        rustup component add rust-src >&2 2>&1 || warn "rust-src konnte nicht hinzugefügt werden."
+    fi
+    if ! command -v bindgen >/dev/null 2>&1; then
+        log "Installiere bindgen-cli $BINDGEN_VERSION ..."
+        cargo install --locked bindgen-cli --version "$BINDGEN_VERSION" >&2 \
+            || die "bindgen-Installation fehlgeschlagen."
+    fi
+
+    local t
+    for t in clang rustc bindgen; do
+        command -v "$t" >/dev/null 2>&1 || die "Pflicht-Tool fehlt nach Setup: $t"
+    done
+    ok "Kernel-Toolchain bereit: clang/llvm + rustc $(rustc --version | awk '{print $2}') + bindgen."
+}
+
+# ===========================================================================
+# 1b) Linux-Quellcode herunterladen und entpacken (-> Pfad auf stdout)
+# ===========================================================================
+fetch_kernel_source() {
+    local ver="$1"
+    local maj="${ver%%.*}"
+    local dst="$WORK/linux-$ver"
+    if [[ -f "$dst/Makefile" ]]; then
+        log "Nutze bereits entpackten Quellbaum $dst" >&2
+        echo "$dst"; return 0
+    fi
+    mkdir -p "$WORK"
+    local tarball="$WORK/linux-$ver.tar.xz"
+    local url="https://cdn.kernel.org/pub/linux/kernel/v${maj}.x/linux-$ver.tar.xz"
+    if [[ ! -f "$tarball" ]]; then
+        log "Lade Linux-$ver-Quellcode: $url" >&2
+        if command -v curl >/dev/null 2>&1; then
+            curl -fSL "$url" -o "$tarball" >&2 || die "Download fehlgeschlagen: $url"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -O "$tarball" "$url" >&2 || die "Download fehlgeschlagen: $url"
+        else
+            die "Weder curl noch wget vorhanden — kann Kernel-Quellen nicht laden."
+        fi
+    fi
+    log "Entpacke $tarball nach $dst ..." >&2
+    ( cd "$WORK" && tar xf "$tarball" )
+    [[ -f "$dst/Makefile" ]] || die "Quellbaum $dst unvollständig."
+    echo "$dst"
+}
+
+# ===========================================================================
 # 1) Kernel beschaffen (bauen / kopieren)
 # ===========================================================================
 prepare_kernel() {
     mkdir -p "$ISODIR/boot"
+    # STANDARD: echten Rust-Kernel selbst bauen — Toolchain einrichten und
+    # Linux-Quellen herunterladen, falls kein Quellbaum vorgegeben wurde.
+    if [[ "$BUILD_KERNEL" -eq 1 && -z "$KERNEL_SRC" ]]; then
+        setup_kernel_toolchain
+        KERNEL_SRC="$(fetch_kernel_source "$KERNEL_VER")"
+    fi
     if [[ -n "$KERNEL_SRC" && -f "$KERNEL_SRC/Makefile" ]]; then
         log "Baue Kernel inkl. rust_core aus $KERNEL_SRC ..."
         bash "$SELF/02-kernel-rust/install-into-kernel.sh" "$KERNEL_SRC"
         ( cd "$KERNEL_SRC"
+          export PATH="$HOME/.cargo/bin:$PATH"
           [[ -f .config ]] || make LLVM=1 defconfig
           ./scripts/kconfig/merge_config.sh .config \
               "$SELF/02-kernel-rust/kernel-config-rust.fragment"
           make LLVM=1 olddefconfig
           make LLVM=1 rustavailable
-          make LLVM=1 -j"$(nproc)" )
+          make LLVM=1 -j"$(nproc)" bzImage modules )
         cp -v "$KERNEL_SRC/arch/x86/boot/bzImage" "$ISODIR/boot/vmlinuz"
         # rust_core.ko ins Rootfs übernehmen (falls als Modul gebaut)
         find "$KERNEL_SRC/drivers/rust_core" -name 'rust_core.ko' \
             -exec cp -v {} "$ROOTFS/rust_core.ko" \; 2>/dev/null || true
+    elif [[ -n "$KERNEL_SRC" ]]; then
+        die "$KERNEL_SRC ist kein Kernel-Source-Tree (keine Makefile gefunden)."
     elif [[ -n "$KERNEL_IMAGE" ]]; then
         log "Nutze vorhandenes Kernel-Image $KERNEL_IMAGE"
         [[ -f "$KERNEL_IMAGE" ]] || die "Kernel-Image $KERNEL_IMAGE nicht gefunden."
@@ -373,9 +455,11 @@ run_test() {
         warn "qemu-system-x86_64 nicht installiert — überspringe Boottest."
         return 0
     fi
-    log "Boote ISO in QEMU (seriell, 20s) ..."
-    timeout 20 qemu-system-x86_64 -m 512 -cdrom "$OUT" \
-        -nographic -serial mon:stdio -no-reboot 2>&1 | head -40 || true
+    log "Boote ISO in QEMU (seriell, bis zu 90s) ..."
+    timeout 90 qemu-system-x86_64 -m 768 -cdrom "$OUT" \
+        -nographic -serial mon:stdio -no-reboot 2>&1 \
+        | grep -aE 'MY-KERNEL|rust_core|/dev/rust_core|\[init\]|mock-ai|Intent=|Selbsttest|KI-Konsole' \
+        || true
 }
 
 # ===========================================================================
@@ -402,8 +486,10 @@ main() {
    sudo dd if="$OUT" of=/dev/sdX bs=4M status=progress oflag=sync
 
  Hinweise zum Customizen:
-   * Alternative Kernel-Source: ./build.sh --kernel-src /pfad/zu/linux-6.13
-   * Demo-Modus: ./build.sh --demo
+   * Standard baut den echten Rust-Kernel (Linux $KERNEL_VER + rust_core).
+   * Eigener Quellbaum: ./build.sh --kernel-src /pfad/zu/linux-6.13
+   * Andere Version: ./build.sh --kernel-ver 6.13
+   * Schneller Demo-Modus (ohne rust_core): ./build.sh --demo
    * Benutzer-Rootfs: ./build.sh --rootfs /mnt/lfs
    * Echten Mojo-Daemon: ./build.sh --use-mojo-binary
    * Test deaktivieren: ./build.sh --no-test
