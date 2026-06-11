@@ -24,7 +24,13 @@
 #   ./build.sh --kernel-ver 6.13     # andere Kernel-Version laden + bauen
 #   ./build.sh --kernel-src /pfad/zu/linux-6.13   # eigenen Quellbaum bauen
 #   ./build.sh --kernel-image /boot/vmlinuz-x.y   # vorhandenes bzImage (Demo)
-#   ./build.sh --rootfs /mnt/lfs     # ein fertiges LFS-Rootfs einpacken
+#   ./build.sh --rootfs /mnt/lfs     # ein fertiges (rohes) Rootfs einpacken
+#   ./build.sh --distro /pfad/zur/distro-rootfs   # KOMPLETTE Distro: bootet per
+#                                    # Autologin direkt in einen Sway/Wayland-
+#                                    # Desktop mit KI-Chat-Widget + Mojo-Daemon.
+#                                    # Fehlende Desktop-Pakete (sway, foot, ...)
+#                                    # werden per chroot best-effort nachinstalliert.
+#   ./build.sh --distro-user name    # Autologin-Benutzer (Default: ai)
 #   ./build.sh --use-mojo-binary     # echten Mojo-Daemon statt Python-Mock
 #   ./build.sh --out /tmp/my.iso
 #   ./build.sh --no-test             # nicht in QEMU testen
@@ -50,6 +56,8 @@ KERNEL_VER="6.13"                   # Linux-Version, die geladen + gebaut wird
 KERNEL_SRC=""                       # leer => Quellen werden heruntergeladen
 KERNEL_IMAGE=""
 EXT_ROOTFS="$SELF/../lfs-root"     # Standard: LFS-Rootfs falls vorhanden
+DISTRO_ROOTFS=""                    # --distro: komplette Distro-Rootfs -> Wayland-Desktop
+DISTRO_USER="ai"                    # Autologin-Benutzer der Distro-Sitzung
 USE_MOJO=0                          # Python-Mock per default
 RUN_TEST=1                          # Test per default aktiviert
 DEMO_MODE=0                         # kein Demo-Modus per default
@@ -68,6 +76,8 @@ while [[ $# -gt 0 ]]; do
         --kernel-ver)       KERNEL_VER="$2"; shift 2 ;;
         --kernel-image)     KERNEL_IMAGE="$2"; KERNEL_SRC=""; BUILD_KERNEL=0; shift 2 ;;
         --rootfs)           EXT_ROOTFS="$2"; shift 2 ;;
+        --distro)           DISTRO_ROOTFS="$2"; shift 2 ;;
+        --distro-user)      DISTRO_USER="$2"; shift 2 ;;
         --out)              OUT="$2"; shift 2 ;;
         --use-mojo-binary)  USE_MOJO=1; shift ;;
         --no-test)          RUN_TEST=0; shift ;;
@@ -92,9 +102,14 @@ check_deps() {
     # BUILD_KERNEL=1 automatisch von setup_kernel_toolchain eingerichtet und
     # daher hier NICHT als harte Voraussetzung geprüft.
 
-    # BusyBox nur ohne externes Rootfs nötig
-    if [[ ! -d "$EXT_ROOTFS" ]]; then
+    # BusyBox nur für das Minimal-Rootfs nötig (nicht bei --distro/--rootfs).
+    if [[ -z "$DISTRO_ROOTFS" && ! -d "$EXT_ROOTFS" ]]; then
         command -v busybox >/dev/null 2>&1 || missing+=("busybox")
+    fi
+
+    # Distro-Modus benötigt chroot (util-linux/coreutils) für die Einrichtung.
+    if [[ -n "$DISTRO_ROOTFS" ]]; then
+        command -v chroot >/dev/null 2>&1 || missing+=("chroot")
     fi
     
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -271,6 +286,23 @@ prepare_rootfs() {
     rm -rf "$ROOTFS"
     mkdir -p "$ROOTFS"/{bin,sbin,etc,proc,sys,dev,run,usr/bin,usr/local/bin,var/log}
 
+    # --- KOMPLETTE Distro-Rootfs (-> Sway/Wayland-Desktop, systemd als PID1) ---
+    if [[ -n "$DISTRO_ROOTFS" ]]; then
+        [[ -d "$DISTRO_ROOTFS" ]] || die "Distro-Rootfs $DISTRO_ROOTFS nicht gefunden."
+        [[ -x "$DISTRO_ROOTFS/sbin/init" || -L "$DISTRO_ROOTFS/sbin/init" || -e "$DISTRO_ROOTFS/lib/systemd/systemd" ]] \
+            || warn "In $DISTRO_ROOTFS ist kein /sbin/init bzw. systemd erkennbar — Boot könnte fehlschlagen."
+        log "Kopiere komplette Distro-Rootfs aus $DISTRO_ROOTFS (das kann dauern) ..."
+        # Leeres Zielverzeichnis: moderne Distros nutzen usrmerge (/bin -> /usr/bin
+        # als Symlink), das sich nicht über vorab angelegte Verzeichnisse kopieren
+        # lässt.
+        rm -rf "$ROOTFS"; mkdir -p "$ROOTFS"
+        cp -a "$DISTRO_ROOTFS"/. "$ROOTFS"/
+        install_components
+        configure_distro_desktop
+        ok "Distro-Rootfs (Wayland-Desktop) bereit unter $ROOTFS"
+        return 0
+    fi
+
     if [[ -d "$EXT_ROOTFS" ]]; then
         log "Kopiere externes Rootfs aus $EXT_ROOTFS ..."
         cp -a "$EXT_ROOTFS"/. "$ROOTFS"/
@@ -310,7 +342,8 @@ install_components() {
     if [[ "$USE_MOJO" -eq 0 ]]; then
         # Python-Mock + Interpreter müssen im Rootfs vorhanden sein.
         cp -v "$SELF/03-mojo-ai/mock_daemon.py" "$ROOTFS/usr/local/bin/mojo_ai_daemon.py"
-        if [[ -z "$EXT_ROOTFS" || ! -d "$EXT_ROOTFS" ]]; then
+        # Im Distro-Modus bringt die Distro ihren eigenen python3 mit.
+        if [[ -z "$DISTRO_ROOTFS" && ( -z "$EXT_ROOTFS" || ! -d "$EXT_ROOTFS" ) ]]; then
             bundle_python
         fi
     fi
@@ -321,6 +354,162 @@ install_components() {
     cp -v "$SELF/03-mojo-ai/client_test.py" "$ROOTFS/usr/local/bin/ai-client"
     cp -v "$SELF/03-mojo-ai/mojo-ai.init"  "$ROOTFS/etc/rc.d/init.d/mojo-ai"
     chmod +x "$ROOTFS/usr/local/bin/"* "$ROOTFS/etc/rc.d/init.d/mojo-ai" 2>/dev/null || true
+}
+
+# ===========================================================================
+# 2b) KOMPLETTE Distro -> Sway/Wayland-Desktop mit KI-Chat einrichten
+# ---------------------------------------------------------------------------
+# Erwartet ein bereits nach $ROOTFS kopiertes, vollständiges Distro-Rootfs
+# (systemd-basiert). Richtet ein: Autologin-Benutzer, Sway-Session auf TTY1,
+# Autostart des Chat-Widgets, Aktivierung von mojo-ai.service + rust_core.ko.
+# Fehlende Desktop-Pakete werden – falls ein Paketmanager vorhanden ist – per
+# chroot best-effort nachinstalliert.
+# ===========================================================================
+
+# Führt ein Kommando im $ROOTFS-chroot aus (mit gemounteten virtuellen FS).
+run_in_distro_chroot() {
+    local cmd="$1"
+    mount --bind /proc    "$ROOTFS/proc"    2>/dev/null || true
+    mount --bind /sys     "$ROOTFS/sys"     2>/dev/null || true
+    mount --bind /dev     "$ROOTFS/dev"     2>/dev/null || true
+    mount --bind /dev/pts "$ROOTFS/dev/pts" 2>/dev/null || true
+    local rc=0
+    chroot "$ROOTFS" /bin/sh -c "$cmd" || rc=$?
+    umount "$ROOTFS/dev/pts" 2>/dev/null || true
+    umount "$ROOTFS/dev"     2>/dev/null || true
+    umount "$ROOTFS/sys"     2>/dev/null || true
+    umount "$ROOTFS/proc"    2>/dev/null || true
+    return $rc
+}
+
+# Installiert die Desktop-Pakete best-effort (überspringt fehlende einzeln).
+install_distro_desktop_packages() {
+    if [[ -x "$ROOTFS/usr/bin/apt-get" ]]; then
+        if chroot "$ROOTFS" /bin/sh -c 'command -v sway >/dev/null 2>&1'; then
+            ok "Sway bereits in der Distro vorhanden — überspringe Paketinstallation."
+            return 0
+        fi
+        log "Installiere Wayland-Desktop-Pakete in die Distro-Rootfs (apt) ..."
+        cp -f /etc/resolv.conf "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
+        run_in_distro_chroot 'DEBIAN_FRONTEND=noninteractive apt-get update -qq' || \
+            warn "apt-get update fehlgeschlagen — Paketinstallation evtl. unvollständig."
+        local pkgs="sway foot grim wofi fonts-dejavu-core dbus dbus-user-session \
+            libgl1-mesa-dri seatd kmod python3 python3-gi gir1.2-gtk-3.0 \
+            gir1.2-gtklayershell-0.1"
+        local p
+        for p in $pkgs; do
+            run_in_distro_chroot "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $p" \
+                || warn "Paket '$p' konnte nicht installiert werden (übersprungen)."
+        done
+    else
+        warn "Kein apt-get in der Distro-Rootfs gefunden — überspringe automatische Paketinstallation."
+        warn "Stelle sicher, dass sway, foot, python3-gi, gir1.2-gtk-3.0 vorab installiert sind."
+    fi
+}
+
+configure_distro_desktop() {
+    [[ "$(id -u)" -eq 0 ]] || die "--distro benötigt root-Rechte (nutze: sudo ./build.sh --distro ...)."
+    log "Richte Sway/Wayland-Desktop + KI-Autostart in der Distro ein ..."
+
+    install_distro_desktop_packages
+
+    # --- Autologin-Benutzer anlegen (idempotent) ---------------------------
+    if ! chroot "$ROOTFS" id "$DISTRO_USER" >/dev/null 2>&1; then
+        log "Lege Benutzer '$DISTRO_USER' an ..."
+        run_in_distro_chroot "useradd -m -s /bin/bash -G video,render,input,audio,tty \"$DISTRO_USER\" || adduser --disabled-password --gecos '' \"$DISTRO_USER\"" \
+            || warn "Benutzeranlage via chroot fehlgeschlagen."
+        # Passwort leeren (Autologin braucht keins).
+        run_in_distro_chroot "passwd -d \"$DISTRO_USER\"" 2>/dev/null || true
+    fi
+    local home="/home/$DISTRO_USER"
+    install -d "$ROOTFS$home/.config/sway"
+
+    # --- Sway-Konfiguration (Bereich 4) als Standard-Session ---------------
+    cp -v "$SELF/04-desktop-widget/sway/config" "$ROOTFS$home/.config/sway/config"
+    install -d "$ROOTFS/etc/sway"
+    cp -f "$SELF/04-desktop-widget/sway/config" "$ROOTFS/etc/sway/config"
+
+    # --- Autostart der Wayland-Sitzung auf TTY1 (~/.bash_profile) ----------
+    cat > "$ROOTFS$home/.bash_profile" <<'PROFILEEOF'
+# MY-KERNEL: startet beim Autologin auf TTY1 direkt die Sway/Wayland-Sitzung.
+if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    [ -d "$XDG_RUNTIME_DIR" ] || { mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"; }
+    export XDG_SESSION_TYPE=wayland
+    export WLR_RENDERER=pixman          # reines Software-Rendering (kein GPU nötig)
+    export WLR_NO_HARDWARE_CURSORS=1
+    # Log in ein benutzerschreibbares Verzeichnis (NICHT /var/log — root-only).
+    mkdir -p "$HOME/.local/state"
+    exec sway >"$HOME/.local/state/sway.log" 2>&1
+fi
+PROFILEEOF
+    cp -f "$ROOTFS$home/.bash_profile" "$ROOTFS$home/.profile"
+
+    # Eigentümer der Home-Dateien korrekt setzen.
+    local uid gid
+    uid="$(chroot "$ROOTFS" id -u "$DISTRO_USER" 2>/dev/null || echo 1000)"
+    gid="$(chroot "$ROOTFS" id -g "$DISTRO_USER" 2>/dev/null || echo 1000)"
+    chown -R "$uid:$gid" "$ROOTFS$home" 2>/dev/null || true
+
+    # --- getty@tty1 Autologin (systemd-Drop-in) ----------------------------
+    install -d "$ROOTFS/etc/systemd/system/getty@tty1.service.d"
+    cat > "$ROOTFS/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $DISTRO_USER --noclear %I \$TERM
+EOF
+
+    # --- mojo-ai.service (Bereich 3) installieren + aktivieren -------------
+    local exec_line
+    if [[ "$USE_MOJO" -eq 1 ]]; then
+        exec_line="/usr/local/bin/mojo_ai_daemon /run/mojo_ai.sock"
+    else
+        exec_line="/usr/bin/python3 /usr/local/bin/mojo_ai_daemon.py --sock /run/mojo_ai.sock"
+    fi
+    cat > "$ROOTFS/etc/systemd/system/mojo-ai.service" <<EOF
+[Unit]
+Description=Mojo AI Inference Daemon (Unix socket /run/mojo_ai.sock)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$exec_line
+ExecStartPost=/bin/sh -c 'for i in \$(seq 1 25); do [ -S /run/mojo_ai.sock ] && break; sleep 0.2; done; chmod 0666 /run/mojo_ai.sock || true'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # --- rust_core.ko beim Boot laden (Bereich 2) --------------------------
+    cat > "$ROOTFS/etc/systemd/system/rust_core.service" <<'EOF'
+[Unit]
+Description=Lade das rust_core-Kernelmodul (/dev/rust_core)
+After=systemd-modules-load.service
+ConditionPathExists=/rust_core.ko
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/insmod /rust_core.ko
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # --- Dienste aktivieren (Symlinks, da systemctl im chroot oft fehlt) ---
+    install -d "$ROOTFS/etc/systemd/system/multi-user.target.wants"
+    ln -sf ../mojo-ai.service   "$ROOTFS/etc/systemd/system/multi-user.target.wants/mojo-ai.service"
+    ln -sf ../rust_core.service "$ROOTFS/etc/systemd/system/multi-user.target.wants/rust_core.service"
+
+    # Auf Multi-User booten (Autologin auf TTY1 startet Sway); kein Display-Manager.
+    ln -sf /lib/systemd/system/multi-user.target "$ROOTFS/etc/systemd/system/default.target"
+
+    # systemd als reales Root behandeln (kein Initrd-Modus im tmpfs-Root).
+    rm -f "$ROOTFS/etc/initrd-release" 2>/dev/null || true
+
+    ok "Distro-Desktop konfiguriert: Autologin '$DISTRO_USER' -> Sway, Widget + mojo-ai.service aktiv."
 }
 
 # --- Eigenständigen Python-Interpreter ins Rootfs bündeln ------------------
@@ -462,6 +651,11 @@ INITEOF
 # 3) Initramfs packen
 # ===========================================================================
 make_initramfs() {
+    # Sicherheitshalber evtl. zurückgebliebene chroot-Bind-Mounts lösen, damit
+    # cpio nicht in Host-/proc//sys/ hineinläuft.
+    for m in dev/pts dev sys proc; do
+        mountpoint -q "$ROOTFS/$m" 2>/dev/null && umount -l "$ROOTFS/$m" 2>/dev/null || true
+    done
     log "Packe Initramfs (cpio + gzip) ..."
     ( cd "$ROOTFS" && find . -print0 \
         | cpio --null --create --format=newc 2>/dev/null \
@@ -475,7 +669,16 @@ make_initramfs() {
 make_iso() {
     log "Erzeuge GRUB-Konfiguration ..."
     mkdir -p "$ISODIR/boot/grub"
-    cat > "$ISODIR/boot/grub/grub.cfg" <<'GRUBEOF'
+
+    # Im Distro-Modus ist die Distro-Rootfs selbst das Initramfs (tmpfs-Root):
+    # systemd wird via rdinit=/sbin/init als PID 1 gestartet und bootet den
+    # Wayland-Desktop. Im Standard-/BusyBox-Modus läuft unser /init-Skript.
+    local kcmdline="console=tty0 console=ttyS0,115200 rust_core.metrics=1"
+    if [[ -n "$DISTRO_ROOTFS" ]]; then
+        kcmdline="$kcmdline rdinit=/sbin/init rw"
+    fi
+
+    cat > "$ISODIR/boot/grub/grub.cfg" <<GRUBEOF
 serial --unit=0 --speed=115200
 terminal_input  serial console
 terminal_output serial console
@@ -484,12 +687,12 @@ set timeout=3
 
 menuentry "MY-KERNEL (LFS + rust_core + Mojo-AI)" {
     echo "Lade Kernel ..."
-    linux  /boot/vmlinuz console=tty0 console=ttyS0,115200 rust_core.metrics=1
+    linux  /boot/vmlinuz $kcmdline
     echo "Lade Initramfs ..."
     initrd /boot/initramfs.img
 }
 menuentry "MY-KERNEL (verbose / debug)" {
-    linux  /boot/vmlinuz console=tty0 console=ttyS0,115200 debug
+    linux  /boot/vmlinuz $kcmdline debug
     initrd /boot/initramfs.img
 }
 GRUBEOF
@@ -509,6 +712,27 @@ run_test() {
         warn "qemu-system-x86_64 nicht installiert — überspringe Boottest."
         return 0
     fi
+
+    # --- Distro-Modus: grafischer Boot, Screenshot des Wayland-Desktops -----
+    if [[ -n "$DISTRO_ROOTFS" ]]; then
+        local shot="$WORK/desktop.ppm" png="$SELF/desktop.png"
+        log "Boote Distro-ISO in QEMU (virtio-gpu, ~70s) und erstelle Screenshot ..."
+        ( sleep 60; printf 'screendump %s\n' "$shot"; sleep 3; printf 'quit\n' ) \
+            | timeout 90 qemu-system-x86_64 -m 3072 -cdrom "$OUT" \
+                -device virtio-gpu-pci -display none -vga none \
+                -serial file:"$WORK/distro-serial.log" -monitor stdio -no-reboot \
+                >/dev/null 2>&1 || true
+        if [[ -f "$shot" ]] && command -v convert >/dev/null 2>&1; then
+            convert "$shot" "$png" 2>/dev/null && ok "Desktop-Screenshot: $png"
+        elif [[ -f "$shot" ]]; then
+            ok "Desktop-Screenshot (PPM): $shot"
+        else
+            warn "Konnte keinen Screenshot erzeugen — siehe $WORK/distro-serial.log"
+        fi
+        grep -aE 'sway|mojo-ai|rust_core|Reached target|systemd' "$WORK/distro-serial.log" 2>/dev/null | tail -15 || true
+        return 0
+    fi
+
     log "Boote ISO in QEMU (seriell, bis zu 90s) ..."
     timeout 90 qemu-system-x86_64 -m 768 -cdrom "$OUT" \
         -nographic -serial mon:stdio -no-reboot 2>&1 \
@@ -519,7 +743,11 @@ run_test() {
 # ===========================================================================
 main() {
     log "MY-KERNEL ISO-Build startet (WORK=$WORK)"
-    log "Modus: $([ "$DEMO_MODE" -eq 1 ] && echo 'DEMO' || echo 'STANDARD (komplettes System mit Kernel-Kompilierung)')"
+    if [[ -n "$DISTRO_ROOTFS" ]]; then
+        log "Modus: DISTRO (komplette Distro-Rootfs -> Sway/Wayland-Desktop mit KI-Chat)"
+    else
+        log "Modus: $([ "$DEMO_MODE" -eq 1 ] && echo 'DEMO' || echo 'STANDARD (komplettes System mit Kernel-Kompilierung)')"
+    fi
     rm -rf "$ISODIR"
     mkdir -p "$ISODIR/boot"
     check_deps
@@ -545,6 +773,7 @@ main() {
    * Andere Version: ./build.sh --kernel-ver 6.13
    * Schneller Demo-Modus (ohne rust_core): ./build.sh --demo
    * Benutzer-Rootfs: ./build.sh --rootfs /mnt/lfs
+   * Komplette Distro -> Wayland-Desktop: sudo ./build.sh --distro /pfad/zur/distro-rootfs
    * Echten Mojo-Daemon: ./build.sh --use-mojo-binary
    * Test deaktivieren: ./build.sh --no-test
 ============================================================================
