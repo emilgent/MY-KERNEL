@@ -32,6 +32,40 @@ Mojo-Daemon rechnet, die Antwort fließt zurück ins Widget.
 
 ---
 
+## Alles zu einer bootfähigen ISO bauen — `build.sh`
+
+`build.sh` bündelt alle 4 Bereiche zu einer hybriden (BIOS+UEFI) ISO
+(`my-kernel.iso`). Die ISO bootet per GRUB einen Kernel + ein Initramfs; das
+Initramfs startet den AI-Daemon und öffnet eine TTY-Chat-Konsole — inklusive
+automatischem End-to-End-Selbsttest im Boot-Log.
+
+```bash
+# Demo-ISO (BusyBox-Rootfs + Host-Kernel + gebündeltes Python + AI-Daemon):
+./build.sh
+
+# Mit echtem Rust-Kernel (baut rust_core in den Kernel ein):
+./build.sh --kernel-src /pfad/zu/linux-6.13
+
+# Vollständiges LFS-Rootfs einpacken / echten Mojo-Daemon nutzen:
+./build.sh --rootfs /mnt/lfs --use-mojo
+
+# In QEMU testen:
+qemu-system-x86_64 -m 768 -cdrom my-kernel.iso -nographic -serial mon:stdio
+# oder direkt:  ./build.sh --test
+```
+
+Pipeline: `check_deps → prepare_rootfs (BusyBox/LFS + Python + Komponenten) →
+prepare_kernel (bauen/kopieren) → make_initramfs (cpio+gzip) → make_iso
+(grub.cfg + grub-mkrescue)`. Host-Abhängigkeiten: `xorriso`, `grub-mkrescue`
+(`grub-pc-bin`/`grub-efi-amd64-bin`), `cpio`, `busybox-static`, optional
+`qemu-system-x86`.
+
+Verifiziert: Die Demo-ISO bootet in QEMU, lädt `/init`, startet den AI-Daemon
+auf `/run/mojo_ai.sock` und der Selbsttest liefert `AI-Selbsttest: PASS` mit
+echter Socket-Antwort.
+
+---
+
 ## Verzeichnis- & Dateiübersicht (mit Ziel-Ablagepfaden)
 
 ### Bereich 1 — `01-lfs-toolchain/`
