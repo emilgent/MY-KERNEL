@@ -188,6 +188,32 @@ fetch_kernel_source() {
 }
 
 # ===========================================================================
+# 1c) Kompatibilitäts-Patches für neuere Rust-Toolchains
+# ===========================================================================
+# Neuere Versionen von clippy (Rust ≥ 1.78) behandeln `useless_transmute` in
+# den von bindgen generierten Dateien als harten Fehler. Diese Transmutes sind
+# korrekt (bindgen nutzt sie für bitfield-Zugriffe auf u8), aber clippy hält
+# sie für unnötig, weil Quell- und Zieltyp identisch sind. Wir erlauben den
+# Lint auf Crate-Ebene in den betroffenen Dateien, ohne den restlichen
+# Kernel-Code zu beeinflussen.
+patch_kernel_rust_compat() {
+    local ksrc="$1"
+    log "Patche Rust-Bindings für Kompatibilität mit neuerer Toolchain ..."
+    local patched=0
+    for f in "$ksrc/rust/bindings/lib.rs" "$ksrc/rust/uapi/lib.rs"; do
+        if [[ -f "$f" ]] && ! grep -q 'clippy::useless_transmute' "$f"; then
+            sed -i '1i #![allow(clippy::useless_transmute)]' "$f"
+            patched=$((patched + 1))
+        fi
+    done
+    if [[ $patched -gt 0 ]]; then
+        ok "Rust-Kompatibilitäts-Patch: $patched Datei(en) angepasst."
+    else
+        log "Rust-Kompatibilitäts-Patch: bereits vorhanden oder nicht nötig."
+    fi
+}
+
+# ===========================================================================
 # 1) Kernel beschaffen (bauen / kopieren)
 # ===========================================================================
 prepare_kernel() {
@@ -201,6 +227,7 @@ prepare_kernel() {
     if [[ -n "$KERNEL_SRC" && -f "$KERNEL_SRC/Makefile" ]]; then
         log "Baue Kernel inkl. rust_core aus $KERNEL_SRC ..."
         bash "$SELF/02-kernel-rust/install-into-kernel.sh" "$KERNEL_SRC"
+        patch_kernel_rust_compat "$KERNEL_SRC"
         ( cd "$KERNEL_SRC"
           export PATH="$HOME/.cargo/bin:$PATH"
           [[ -f .config ]] || make LLVM=1 defconfig
